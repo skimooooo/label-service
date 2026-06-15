@@ -1,45 +1,86 @@
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import numpy as np
 import textwrap
 
 BASE_IMG = "base.png"
-
-# Address block bbox in original image coords
-X0, Y0, X1, Y1 = 750, 287, 855, 355
-ANGLE = -2.0
-
 FONT_BOLD_PATH = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
 FONT_REG_PATH = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
-
 TEXT_COLOR = (35, 40, 50, 255)
+ANGLE = -2.0
+
+
+def make_texture_patch(base, region, top_strip_y, bot_strip_y, seed=42):
+    """
+    Build a realistic paper-texture patch for `region` (x0,y0,x1,y1) by
+    vertically blending real pixel strips sampled from top_strip_y and
+    bot_strip_y (each a (y0,y1) tuple of clean blank rows), with noise
+    derived from those strips' own variance.
+    """
+    x0, y0, x1, y1 = region
+    pw, ph = x1 - x0, y1 - y0
+
+    top_strip = base.crop((x0, top_strip_y[0], x1, top_strip_y[1]))
+    bot_strip = base.crop((x0, bot_strip_y[0], x1, bot_strip_y[1]))
+
+    top_arr = np.array(top_strip).astype(float)
+    bot_arr = np.array(bot_strip).astype(float)
+
+    top_row = top_arr.mean(axis=0)
+    bot_row = bot_arr.mean(axis=0)
+
+    patch = np.zeros((ph, pw, 3), dtype=float)
+    for y in range(ph):
+        t = y / max(ph - 1, 1)
+        patch[y] = top_row * (1 - t) + bot_row * t
+
+    noise_source = np.concatenate([top_arr - top_row, bot_arr - bot_row], axis=0)
+    noise_std = noise_source.std(axis=(0, 2)).mean()
+    rng = np.random.default_rng(seed)
+    luminance_noise = rng.normal(0, 1, size=(ph, pw, 1)) * noise_std * 0.5
+    noise = np.repeat(luminance_noise, 3, axis=2)
+    patch = np.clip(patch + noise, 0, 255).astype('uint8')
+
+    patch_img = Image.fromarray(patch, 'RGB')
+    return patch_img.filter(ImageFilter.GaussianBlur(0.4))
+
+
+def paste_with_feather(base_img, patch_img, position, feather=6):
+    """
+    Paste patch_img onto base_img at position with a feathered (soft-edge)
+    alpha mask so the patch blends gradually into surrounding pixels.
+    """
+    pw, ph = patch_img.size
+    # Build alpha mask: fully opaque in center, fading to 0 over `feather` px at edges
+    mask = Image.new("L", (pw, ph), 255)
+    mask_draw = ImageDraw.Draw(mask)
+    for i in range(feather):
+        alpha = int(255 * (i + 1) / feather)
+        mask_draw.rectangle([i, i, pw - 1 - i, ph - 1 - i], outline=alpha)
+    mask = mask.filter(ImageFilter.GaussianBlur(feather / 2))
+
+    base_img.paste(patch_img, position, mask)
 
 
 def generate_label(recipient: dict, tracking_number: str = None, out_path: str = None):
-    """
-    recipient: dict with keys: name, line1 (street), line2 (city), line3 (postal code),
-               line4 (country), phone
-    tracking_number: optional, replaces the TRK# on the label
-    """
     base = Image.open(BASE_IMG).convert("RGB")
-    # Address block bbox in original image coords (widened slightly to avoid overflow)
-    x0, y0, x1, y1 = X0, Y0, X1 + 15, Y1
-    patch_w, patch_h = x1 - x0, y1 - y0
-
-    # Patch out old text with sampled background
-    sample_strip = base.crop((x1 + 2, y0, x1 + 10, y1))
-    sample_strip = sample_strip.resize((patch_w, patch_h), Image.BILINEAR)
-    sample_strip = sample_strip.filter(ImageFilter.GaussianBlur(0.8))
-
     patched = base.copy()
-    patched.paste(sample_strip, (x0, y0))
 
-    # Build lines, wrapping long fields
-    lines = []  # list of (text, is_bold)
+    # --- Address block ---
+    # Region: (x0,y0,x1,y1), donor strips above/below
+    addr_region = (753, 291, 890, 363)
+    addr_top_strip = (363, 366)
+    addr_bot_strip = (363, 366)
+
+    addr_patch = make_texture_patch(base, addr_region, addr_top_strip, addr_bot_strip, seed=42)
+    paste_with_feather(patched, addr_patch, (addr_region[0], addr_region[1]), feather=5)
+
+    # Build recipient text lines
+    lines = []
 
     def wrap_field(text, max_chars):
         return textwrap.wrap(text, width=max_chars) or [""]
 
-    # Max characters per line before wrapping (tuned for ~13-15px font, ~120px width)
-    MAX_CHARS_NAME = 18   # bold font is wider per character
+    MAX_CHARS_NAME = 18
     MAX_CHARS = 24
 
     for w in wrap_field(recipient["name"], MAX_CHARS_NAME):
@@ -53,11 +94,9 @@ def generate_label(recipient: dict, tracking_number: str = None, out_path: str =
         lines.append((recipient["phone"], False))
 
     n_lines = len(lines)
-
-    # Auto-shrink font if too many lines (base design assumes 6 lines)
-    base_font_size_bold = 15
-    base_font_size_reg = 13
-    base_line_height = 11
+    base_font_size_bold = 14
+    base_font_size_reg = 12
+    base_line_height = 10
     max_lines_default = 6
 
     if n_lines > max_lines_default:
@@ -73,61 +112,51 @@ def generate_label(recipient: dict, tracking_number: str = None, out_path: str =
     font_bold = ImageFont.truetype(FONT_BOLD_PATH, font_size_bold)
     font_reg = ImageFont.truetype(FONT_REG_PATH, font_size_reg)
 
-    layer_w, layer_h = patch_w + 30, patch_h + 30
+    pw, ph = addr_region[2] - addr_region[0], addr_region[3] - addr_region[1]
+    layer_w, layer_h = pw + 30, ph + 30
     text_layer = Image.new("RGBA", (layer_w, layer_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(text_layer)
 
+    font_label = ImageFont.truetype(FONT_REG_PATH, 13)
+
+    # "To:" header
     y = 2
+    draw.text((2, y), "To:", font=font_label, fill=TEXT_COLOR)
+    y += 16
+
     for text, is_bold in lines:
         font = font_bold if is_bold else font_reg
         draw.text((2, y), text, font=font, fill=TEXT_COLOR)
         y += line_height + (2 if is_bold else 0)
 
     rotated = text_layer.rotate(ANGLE, resample=Image.BICUBIC, expand=False)
-    patched.paste(rotated, (x0 - 2, y0 - 2), rotated)
+    patched.paste(rotated, (addr_region[0] - 2, addr_region[1] - 2), rotated)
 
+    # --- Tracking number ---
     if tracking_number:
-        patched = replace_tracking_number(patched, tracking_number)
+        trk_region = (623, 263, 855, 282)
+        trk_top_strip = (263, 267)
+        trk_bot_strip = (283, 287)
+
+        trk_patch = make_texture_patch(base, trk_region, trk_top_strip, trk_bot_strip, seed=43)
+        paste_with_feather(patched, trk_patch, (trk_region[0], trk_region[1]), feather=5)
+
+        tpw, tph = trk_region[2] - trk_region[0], trk_region[3] - trk_region[1]
+        trk_layer = Image.new("RGBA", (tpw + 20, tph + 10), (0, 0, 0, 0))
+        trk_draw = ImageDraw.Draw(trk_layer)
+        trk_font = ImageFont.truetype(FONT_BOLD_PATH, 17)
+        trk_draw.text((5, 1), f"TRK # {tracking_number}", font=trk_font, fill=(20, 20, 20, 255))
+        trk_rotated = trk_layer.rotate(ANGLE, resample=Image.BICUBIC, expand=False)
+        patched.paste(trk_rotated, (trk_region[0] - 2, trk_region[1] - 1), trk_rotated)
 
     if out_path:
         patched.save(out_path)
     return patched
 
 
-def replace_tracking_number(img: Image.Image, tracking_number: str):
-    # TRK # line bbox in original image coords
-    tx0, ty0, tx1, ty1 = 623, 263, 855, 282
-    pw, ph = tx1 - tx0, ty1 - ty0
-
-    # Synthetic paper-color patch (sampled clean label color, bluish-white)
-    base_color = (199, 217, 241)
-    patch = Image.new("RGB", (pw, ph), base_color)
-    # add a very subtle gradient to mimic lighting falloff toward the right edge
-    import numpy as np
-    arr = np.array(patch).astype(float)
-    grad = np.linspace(0, -10, pw)  # slightly darker toward right
-    arr[:, :, 0] += grad[np.newaxis, :]
-    arr[:, :, 1] += grad[np.newaxis, :]
-    arr[:, :, 2] += grad[np.newaxis, :]
-    arr = np.clip(arr, 0, 255).astype('uint8')
-    patch = Image.fromarray(arr)
-    patch = patch.filter(ImageFilter.GaussianBlur(0.3))
-
-    img = img.copy()
-    img.paste(patch, (tx0, ty0))
-
-    layer = Image.new("RGBA", (pw + 20, ph + 10), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(layer)
-    font = ImageFont.truetype(FONT_BOLD_PATH, 17)
-    draw.text((5, 1), f"TRK # {tracking_number}", font=font, fill=(20, 20, 20, 255))
-    rotated = layer.rotate(ANGLE, resample=Image.BICUBIC, expand=False)
-    img.paste(rotated, (tx0 - 2, ty0 - 1), rotated)
-    return img
-
-
 if __name__ == "__main__":
-    # Test case 1: short German address
-    generate_label(
+    # Test 1: short German address
+    img1 = generate_label(
         {
             "name": "Sarah Klein",
             "line1": "Hauptstr. 45",
@@ -137,21 +166,21 @@ if __name__ == "__main__":
             "phone": "+49 170 234 5678",
         },
         tracking_number="9981 4523 7710",
-        out_path="test_short.png",
+        out_path="final_v3_short.png",
     )
 
-    # Test case 2: long name + long street (Libyan style)
-    generate_label(
+    # Test 2: long Libyan address
+    img2 = generate_label(
         {
-            "name": "Abdulrahman Mohammed Al-Zawawi",
-            "line1": "Souk Al Jumaa Street, Building 12, Near Al Noor Pharmacy",
+            "name": "Mohamed Al-Bargathi",
+            "line1": "Souk Al Thalatha, Hay Al Andalus",
             "line2": "Tripoli",
             "line3": "",
             "line4": "Libya",
-            "phone": "+218 91 234 5678",
+            "phone": "+218 92 555 1234",
         },
-        tracking_number="LY-2026-008812",
-        out_path="test_long.png",
+        tracking_number="ARE-2026-44120",
+        out_path="final_v3_long.png",
     )
 
     print("done")
