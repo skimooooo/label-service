@@ -1,15 +1,18 @@
 """
-Deterministic shipping-label compositor.
+Deterministic shipping-label compositor v4.
 
-Builds a flat label image with Pillow (exact, correctly-spelled text),
-then warps it onto the base package photo using OpenCV perspective
-transform, matching the photographed label's position/angle, with
-blur/noise/contrast adjustments for realism.
+- High-resolution flat label (4x), downsampled with LANCZOS for crisp text
+- Real QR code cropped from base photo, pasted back at original position
+- TF-XXXXXXXXXX tracking format, barcode visually matches its digits
+- Sampled paper color from base photo (off-white, not blue)
+- Minimal expansion (0.5-1%) of destination corners
+- Clean To: block (no phone unless provided), supports German ß etc.
+- Very light blur/noise for realism
 """
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -17,7 +20,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 BASE_IMAGE_PATH = "base.png"
 
-LABEL_W, LABEL_H = 600, 850
+SCALE = 4  # supersampling factor for crisp text
+LABEL_W, LABEL_H = 600 * SCALE, 850 * SCALE
 
 # Four corners of the real label in the base photo: TL, TR, BR, BL
 DEST_CORNERS = np.array([
@@ -27,37 +31,58 @@ DEST_CORNERS = np.array([
     [571, 490],
 ], dtype=np.float32)
 
+# QR code region in the base photo (x0, y0, x1, y1)
+QR_REGION = (848, 418, 932, 488)
+
 FONT_DIR = "/usr/share/fonts/truetype/liberation"
 FONT_BOLD = f"{FONT_DIR}/LiberationSans-Bold.ttf"
 FONT_REG = f"{FONT_DIR}/LiberationSans-Regular.ttf"
 
-TEXT_COLOR = (30, 30, 35)
-LINE_COLOR = (60, 60, 70)
+TEXT_COLOR = (25, 25, 30)
+LINE_COLOR_STRONG = (50, 50, 55)
+LINE_COLOR_THIN = (90, 90, 95)
+
+
+def get_paper_color(base_bgr: np.ndarray) -> tuple:
+    """Sample median paper color from clean areas of the original label."""
+    samples_xy = [(650, 200), (700, 400), (800, 470), (620, 350), (750, 480)]
+    samples = []
+    for x, y in samples_xy:
+        b, g, r = base_bgr[y, x]
+        samples.append((int(r), int(g), int(b)))
+    arr = np.array(samples, dtype=float)
+    median = np.median(arr, axis=0)
+    # Pull slightly toward neutral gray (desaturate) for an off-white look
+    gray = median.mean()
+    desat = 0.25
+    final = median * (1 - desat) + gray * desat
+    return tuple(int(c) for c in final)
 
 
 # ---------------------------------------------------------------------------
-# Build the flat label with Pillow
+# Build the flat label with Pillow (high resolution)
 # ---------------------------------------------------------------------------
 
-def build_flat_label(data: dict) -> Image.Image:
+def build_flat_label(data: dict, paper_color: tuple) -> Image.Image:
     """
     data keys: recipient_name, address_line_1, postal_city, country,
-               phone (optional), tracking_number
+               phone (optional), tracking_number (format TF-XXXXXXXXXX)
     """
-    label = Image.new("RGB", (LABEL_W, LABEL_H), (200, 217, 238))
+    s = SCALE
+    label = Image.new("RGB", (LABEL_W, LABEL_H), paper_color)
     draw = ImageDraw.Draw(label)
 
-    margin = 30
+    margin = 30 * s
     w = LABEL_W
 
-    f_brand = ImageFont.truetype(FONT_BOLD, 38)
-    f_service_small = ImageFont.truetype(FONT_BOLD, 18)
-    f_route = ImageFont.truetype(FONT_BOLD, 46)
-    f_trk = ImageFont.truetype(FONT_BOLD, 26)
-    f_label_small = ImageFont.truetype(FONT_REG, 16)
-    f_text = ImageFont.truetype(FONT_REG, 17)
-    f_text_bold = ImageFont.truetype(FONT_BOLD, 18)
-    f_footer = ImageFont.truetype(FONT_REG, 14)
+    f_brand = ImageFont.truetype(FONT_BOLD, 38 * s)
+    f_service_small = ImageFont.truetype(FONT_BOLD, 20 * s)
+    f_route = ImageFont.truetype(FONT_BOLD, 46 * s)
+    f_trk = ImageFont.truetype(FONT_BOLD, 26 * s)
+    f_label_small = ImageFont.truetype(FONT_REG, 16 * s)
+    f_text = ImageFont.truetype(FONT_REG, 17 * s)
+    f_text_bold = ImageFont.truetype(FONT_BOLD, 18 * s)
+    f_footer = ImageFont.truetype(FONT_REG, 14 * s)
 
     y = margin
 
@@ -65,44 +90,52 @@ def build_flat_label(data: dict) -> Image.Image:
     draw.text((margin, y), "TrackFlow", font=f_brand, fill=TEXT_COLOR)
     tf_text = "TF-EXPRESS"
     tf_w = draw.textlength(tf_text, font=f_service_small)
-    draw.text((w - margin - tf_w, y + 14), tf_text, font=f_service_small, fill=TEXT_COLOR)
-    y += 60
-    draw.line([(margin, y), (w - margin, y)], fill=LINE_COLOR, width=2)
-    y += 25
+    draw.text((w - margin - tf_w, y + 14 * s), tf_text, font=f_service_small, fill=TEXT_COLOR)
+    y += 60 * s
+    draw.line([(margin, y), (w - margin, y)], fill=LINE_COLOR_STRONG, width=3 * s)
+    y += 25 * s
 
     # --- Route ---
     route_text = "US - DE - DE"
     route_w = draw.textlength(route_text, font=f_route)
     draw.text(((w - route_w) / 2, y), route_text, font=f_route, fill=TEXT_COLOR)
-    y += 75
-    draw.line([(margin, y), (w - margin, y)], fill=LINE_COLOR, width=2)
-    y += 20
+    y += 75 * s
+    draw.line([(margin, y), (w - margin, y)], fill=LINE_COLOR_THIN, width=2 * s)
+    y += 20 * s
 
-    # --- Barcode (decorative) ---
-    barcode_h = 55
-    rng = np.random.default_rng(7)
-    x = margin + 10
-    bx_end = w - margin - 10
+    # --- Barcode: visually correspond to the tracking number digits ---
+    barcode_h = 55 * s
+    digits = "".join(ch for ch in data["tracking_number"] if ch.isdigit())
+    if not digits:
+        digits = "0123456789"
+    x = margin + 10 * s
+    bx_end = w - margin - 10 * s
+    avail = bx_end - x
+    # derive bar widths from digits, cycling through them
+    di = 0
     while x < bx_end:
-        bw = rng.integers(2, 6)
-        if rng.random() > 0.4:
-            draw.rectangle([x, y, x + bw, y + barcode_h], fill=(20, 20, 20))
-        x += bw + rng.integers(2, 5)
-    y += barcode_h + 12
+        d = int(digits[di % len(digits)])
+        di += 1
+        bw = (2 + (d % 5)) * s  # bar width 2-6 px (scaled), driven by digit
+        gap = (1 + ((d * 3) % 4)) * s
+        if d % 7 != 0:  # mostly draw bars, occasional gap-only
+            draw.rectangle([x, y, x + bw, y + barcode_h], fill=(15, 15, 15))
+        x += bw + gap
+    y += barcode_h + 12 * s
 
     # --- Tracking number ---
-    trk_text = f"TRK # {data['tracking_number']}"
+    trk_text = data["tracking_number"]
     trk_w = draw.textlength(trk_text, font=f_trk)
     draw.text(((w - trk_w) / 2, y), trk_text, font=f_trk, fill=TEXT_COLOR)
-    y += 45
-    draw.line([(margin, y), (w - margin, y)], fill=LINE_COLOR, width=2)
-    y += 18
+    y += 45 * s
+    draw.line([(margin, y), (w - margin, y)], fill=LINE_COLOR_THIN, width=2 * s)
+    y += 18 * s
 
     # --- From / To columns ---
     col_split = w // 2
 
     draw.text((margin, y), "From:", font=f_text_bold, fill=TEXT_COLOR)
-    fy = y + 24
+    fy = y + 24 * s
     for line in [
         "Sunny Global Trading PLLC",
         "200 Pine St, 23rd",
@@ -111,14 +144,11 @@ def build_flat_label(data: dict) -> Image.Image:
         "+1 971-123 4567",
     ]:
         draw.text((margin, fy), line, font=f_text, fill=TEXT_COLOR)
-        fy += 24
+        fy += 24 * s
 
-    draw.line([(col_split, y - 5), (col_split, fy + 5)], fill=LINE_COLOR, width=2)
+    tx = col_split + 25 * s
+    available_w = w - margin - tx
 
-    tx = col_split + 25
-    available_w = w - margin - tx  # width available for To: column text
-
-    # Estimate total wrapped line count to decide font size
     def estimate_lines(text, font, avail_w):
         words = text.split(" ")
         lines = 1
@@ -132,28 +162,29 @@ def build_flat_label(data: dict) -> Image.Image:
                 line = word
         return lines
 
-    f_text_try = f_text
-    f_text_bold_try = f_text_bold
-    line_h_try = 24
-    name_line_h_try = 26
+    # Build the To: field list - only include phone if provided
+    to_fields = [
+        (data["recipient_name"], f_text_bold, 26 * s),
+        (data["address_line_1"], f_text, 24 * s),
+        (data["postal_city"], f_text, 24 * s),
+        (data["country"], f_text, 24 * s),
+    ]
+    if data.get("phone"):
+        to_fields.append((data["phone"], f_text, 24 * s))
 
-    total_lines = (
-        estimate_lines(data["recipient_name"], f_text_bold_try, available_w)
-        + estimate_lines(data["address_line_1"], f_text_try, available_w)
-        + estimate_lines(data["postal_city"], f_text_try, available_w)
-        + estimate_lines(data["country"], f_text_try, available_w)
-        + (estimate_lines(data["phone"], f_text_try, available_w) if data.get("phone") else 0)
-    )
+    total_lines = sum(estimate_lines(text, font, available_w) for text, font, _ in to_fields)
 
+    # Shrink font if content would overflow
     if total_lines > 6:
-        f_text_try = ImageFont.truetype(FONT_REG, 14)
-        f_text_bold_try = ImageFont.truetype(FONT_BOLD, 15)
-        line_h_try = 20
-        name_line_h_try = 22
-        available_w = w - margin - tx  # recompute not needed, same width
+        f_text_small = ImageFont.truetype(FONT_REG, 14 * s)
+        f_text_bold_small = ImageFont.truetype(FONT_BOLD, 15 * s)
+        to_fields = [
+            (text, (f_text_bold_small if font is f_text_bold else f_text_small), int(lh * 20 / 24))
+            for text, font, lh in to_fields
+        ]
 
     draw.text((tx, y), "To:", font=f_text_bold, fill=TEXT_COLOR)
-    ty = y + 24
+    ty = y + 24 * s
 
     def draw_wrapped(text, font, ty, line_h):
         words = text.split(" ")
@@ -171,59 +202,46 @@ def build_flat_label(data: dict) -> Image.Image:
             ty += line_h
         return ty
 
-    ty = draw_wrapped(data["recipient_name"], f_text_bold_try, ty, name_line_h_try)
-    ty = draw_wrapped(data["address_line_1"], f_text_try, ty, line_h_try)
-    ty = draw_wrapped(data["postal_city"], f_text_try, ty, line_h_try)
-    ty = draw_wrapped(data["country"], f_text_try, ty, line_h_try)
-    if data.get("phone"):
-        ty = draw_wrapped(data["phone"], f_text_try, ty, line_h_try)
+    for text, font, line_h in to_fields:
+        ty = draw_wrapped(text, font, ty, line_h)
 
-    y = max(fy, ty) + 15
-    draw.line([(margin, y), (w - margin, y)], fill=LINE_COLOR, width=2)
-    y += 18
+    draw.line([(col_split, y - 5 * s), (col_split, max(fy, ty) + 5 * s)], fill=LINE_COLOR_THIN, width=2 * s)
+
+    y = max(fy, ty) + 15 * s
+    draw.line([(margin, y), (w - margin, y)], fill=LINE_COLOR_THIN, width=2 * s)
+    y += 18 * s
 
     # --- Service / Weight / Pieces row ---
     col_w = (w - 2 * margin) / 3
-    draw.text((margin, y), "Service", font=f_label_small, fill=(90, 90, 100))
-    draw.text((margin, y + 22), "EXPRESS", font=f_text_bold, fill=TEXT_COLOR)
+    draw.text((margin, y), "Service", font=f_label_small, fill=(95, 95, 100))
+    draw.text((margin, y + 22 * s), "EXPRESS", font=f_text_bold, fill=TEXT_COLOR)
 
-    draw.text((margin + col_w, y), "Weight", font=f_label_small, fill=(90, 90, 100))
-    draw.text((margin + col_w, y + 22), "12.40 KG", font=f_text_bold, fill=TEXT_COLOR)
+    draw.text((margin + col_w, y), "Weight", font=f_label_small, fill=(95, 95, 100))
+    draw.text((margin + col_w, y + 22 * s), "12.40 KG", font=f_text_bold, fill=TEXT_COLOR)
 
-    draw.text((margin + 2 * col_w, y), "Pieces", font=f_label_small, fill=(90, 90, 100))
-    draw.text((margin + 2 * col_w, y + 22), "1 / 1", font=f_text_bold, fill=TEXT_COLOR)
+    draw.text((margin + 2 * col_w, y), "Pieces", font=f_label_small, fill=(95, 95, 100))
+    draw.text((margin + 2 * col_w, y + 22 * s), "1 / 1", font=f_text_bold, fill=TEXT_COLOR)
 
-    y += 60
-    draw.line([(margin, y), (w - margin, y)], fill=LINE_COLOR, width=2)
-    y += 18
+    y += 60 * s
+    draw.line([(margin, y), (w - margin, y)], fill=LINE_COLOR_THIN, width=2 * s)
+    y += 18 * s
 
-    # --- Parcel Ref + QR placeholder ---
+    # --- Parcel Ref (no QR drawn here - real QR pasted back after warp) ---
     draw.text((margin, y), "Parcel Ref:", font=f_text_bold, fill=TEXT_COLOR)
-    draw.text((margin, y + 24), "EGT-5400-78910", font=f_text_bold, fill=TEXT_COLOR)
+    draw.text((margin, y + 24 * s), "EGT-5400-78910", font=f_text_bold, fill=TEXT_COLOR)
 
-    qr_size = 90
-    qr_x = w - margin - qr_size
-    qr_y = y - 5
-    rng2 = np.random.default_rng(11)
-    cell = qr_size // 9
-    for i in range(9):
-        for j in range(9):
-            if rng2.random() > 0.5:
-                draw.rectangle([
-                    qr_x + i * cell, qr_y + j * cell,
-                    qr_x + (i + 1) * cell, qr_y + (j + 1) * cell
-                ], fill=(20, 20, 20))
-    for cx, cy in [(qr_x, qr_y), (qr_x + qr_size - cell * 2, qr_y), (qr_x, qr_y + qr_size - cell * 2)]:
-        draw.rectangle([cx, cy, cx + cell * 2, cy + cell * 2], outline=(20, 20, 20), width=3)
-
-    y += 70
-    draw.line([(margin, y), (w - margin, y)], fill=LINE_COLOR, width=2)
-    y += 18
+    y += 70 * s
+    draw.line([(margin, y), (w - margin, y)], fill=LINE_COLOR_THIN, width=2 * s)
+    y += 18 * s
 
     # --- Footer ---
-    draw.text((margin, y), "trackflow.ltd/track", font=f_footer, fill=(90, 90, 100))
+    draw.text((margin, y), "trackflow.ltd/track", font=f_footer, fill=(95, 95, 100))
 
-    return label
+    # Downsample to target resolution with high-quality filter before
+    # warping (large ratio downsampling needs Lanczos pre-filtering to
+    # avoid aliasing; the warp itself uses CUBIC to avoid ringing)
+    final = label.resize((LABEL_W // SCALE, LABEL_H // SCALE), Image.LANCZOS)
+    return final
 
 
 # ---------------------------------------------------------------------------
@@ -243,22 +261,23 @@ def warp_and_composite(base_img_bgr: np.ndarray, label_img: Image.Image, dest_co
 
     h, w = base_img_bgr.shape[:2]
 
+    # Minimal expansion (0.8%) just to cover old label edges
     centroid = dest_corners.mean(axis=0)
-    expanded_corners = centroid + (dest_corners - centroid) * 1.04
-    M_mask = cv2.getPerspectiveTransform(src_corners, expanded_corners.astype(np.float32))
-    warped_label = cv2.warpPerspective(label_cv, M_mask, (w, h))
+    expanded_corners = centroid + (dest_corners - centroid) * 1.008
+    M = cv2.getPerspectiveTransform(src_corners, expanded_corners.astype(np.float32))
+    warped_label = cv2.warpPerspective(label_cv, M, (w, h), flags=cv2.INTER_CUBIC)
 
     mask = np.ones((lh, lw), dtype=np.uint8) * 255
-    warped_mask = cv2.warpPerspective(mask, M_mask, (w, h))
+    warped_mask = cv2.warpPerspective(mask, M, (w, h), flags=cv2.INTER_LINEAR)
 
-    # Realism adjustments
-    warped_label = cv2.GaussianBlur(warped_label, (3, 3), 0.6)
-    warped_label = cv2.convertScaleAbs(warped_label, alpha=0.97, beta=2)
-
-    noise = np.random.default_rng(3).normal(0, 4, warped_label.shape).astype(np.float32)
+    # Very light realism adjustments
+    warped_label = cv2.GaussianBlur(warped_label, (3, 3), 0.3)
+    noise = np.random.default_rng(3).normal(0, 1.2, warped_label.shape).astype(np.float32)
     warped_label = np.clip(warped_label.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    sharpen_kernel = np.array([[0, -0.04, 0], [-0.04, 1.16, -0.04], [0, -0.04, 0]])
+    warped_label = cv2.filter2D(warped_label, -1, sharpen_kernel)
 
-    warped_mask = cv2.GaussianBlur(warped_mask, (9, 9), 3)
+    warped_mask = cv2.GaussianBlur(warped_mask, (5, 5), 1.5)
     mask_f = (warped_mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
 
     result = (base_img_bgr.astype(np.float32) * (1 - mask_f) + warped_label.astype(np.float32) * mask_f)
@@ -272,8 +291,9 @@ def warp_and_composite(base_img_bgr: np.ndarray, label_img: Image.Image, dest_co
 def generate_label(recipient: dict, tracking_number: str = None, out_path: str = None):
     """
     recipient: dict with keys name, line1 (street), line2 (city), line3
-               (postal code), line4 (country), phone
-    tracking_number: string, will be displayed as 'TRK # <tracking_number>'
+               (postal code), line4 (country), phone (optional)
+    tracking_number: string in format 'TF-XXXXXXXXXX' (digits). If a plain
+                     number is passed, it will be formatted as TF-<digits>.
     Returns a PIL.Image.Image (RGB). If out_path is given, also saves to disk.
     """
     postal_code = recipient.get("line3", "")
@@ -283,22 +303,57 @@ def generate_label(recipient: dict, tracking_number: str = None, out_path: str =
     else:
         postal_city_combined = postal_code or city
 
+    # Normalize tracking number to TF-XXXXXXXXXX format
+    trk = tracking_number or ""
+    digits_only = "".join(ch for ch in trk if ch.isdigit())
+    if trk.upper().startswith("TF-"):
+        trk_formatted = trk.upper()
+    elif digits_only:
+        trk_formatted = f"TF-{digits_only}"
+    else:
+        trk_formatted = trk
+
     data = {
         "recipient_name": recipient["name"],
         "address_line_1": recipient.get("line1", ""),
         "postal_city": postal_city_combined,
         "country": recipient.get("line4", ""),
         "phone": recipient.get("phone", ""),
-        "tracking_number": tracking_number or "",
+        "tracking_number": trk_formatted,
     }
-
-    flat = build_flat_label(data)
 
     base_bgr = cv2.imread(BASE_IMAGE_PATH)
     if base_bgr is None:
         raise FileNotFoundError(BASE_IMAGE_PATH)
 
+    paper_color = get_paper_color(base_bgr)
+    flat = build_flat_label(data, paper_color)
+
     result_bgr = warp_and_composite(base_bgr, flat, DEST_CORNERS)
+
+    # Paste the real QR code crop from the original photo back at its
+    # original position (already in correct photo-perspective), with
+    # feathered edges so the paste blends into the new label's paper tone
+    qx0, qy0, qx1, qy1 = QR_REGION
+    qr_crop = base_bgr[qy0:qy1, qx0:qx1].astype(np.float32)
+    qh, qw = qr_crop.shape[:2]
+
+    # Feather mask: full opacity in center, fading at edges
+    feather = 8
+    qmask = np.ones((qh, qw), dtype=np.float32)
+    for i in range(feather):
+        alpha = (i + 1) / feather
+        qmask[i, :] *= alpha
+        qmask[-(i + 1), :] *= alpha
+        qmask[:, i] *= alpha
+        qmask[:, -(i + 1)] *= alpha
+    qmask = cv2.GaussianBlur(qmask, (5, 5), 2)
+    qmask3 = qmask[:, :, np.newaxis]
+
+    region = result_bgr[qy0:qy1, qx0:qx1].astype(np.float32)
+    blended = region * (1 - qmask3) + qr_crop * qmask3
+    result_bgr[qy0:qy1, qx0:qx1] = np.clip(blended, 0, 255).astype(np.uint8)
+
     result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
     result_img = Image.fromarray(result_rgb)
 
@@ -311,13 +366,12 @@ if __name__ == "__main__":
     img = generate_label(
         {
             "name": "Skylar Lippert",
-            "line1": "Lise-Meitner-Strasse 21",
+            "line1": "Lise-Meitner-Straße 21",
             "line2": "Geilenkirchen",
             "line3": "52511",
             "line4": "Germany",
-            "phone": "+49 301 123 4567",
         },
-        tracking_number="2550 1367 9724 782",
-        out_path="test_output.png",
+        tracking_number="5839174268",
+        out_path="test_v4.png",
     )
     print("done", img.size)
