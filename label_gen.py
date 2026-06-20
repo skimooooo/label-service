@@ -31,6 +31,9 @@ DEST_CORNERS = np.array([
     [571, 490],
 ], dtype=np.float32)
 
+# Barcode region in the base photo (x0, y0, x1, y1) - pasted back unchanged
+BARCODE_REGION = (615, 225, 860, 260)
+
 # (QR region removed in this version - no paste-back)
 
 FONT_DIR = "/usr/share/fonts/truetype/liberation"
@@ -365,6 +368,28 @@ def generate_label(recipient: dict, tracking_number: str = None, out_path: str =
     flat = build_flat_label(data, paper_color)
 
     result_bgr = warp_and_composite(base_bgr, flat, DEST_CORNERS)
+
+    # Barcode must stay pixel-identical to the original photo: paste the
+    # real barcode region back from base_bgr, with feathered edges so it
+    # blends seamlessly with the newly-warped label around it.
+    bx0, by0, bx1, by1 = BARCODE_REGION
+    barcode_crop = base_bgr[by0:by1, bx0:bx1].astype(np.float32)
+    bh, bw = barcode_crop.shape[:2]
+
+    feather = 6
+    bmask = np.ones((bh, bw), dtype=np.float32)
+    for i in range(feather):
+        a = (i + 1) / feather
+        bmask[i, :] *= a
+        bmask[-(i + 1), :] *= a
+        bmask[:, i] *= a
+        bmask[:, -(i + 1)] *= a
+    bmask = cv2.GaussianBlur(bmask, (5, 5), 1.5)
+    bmask3 = bmask[:, :, np.newaxis]
+
+    region = result_bgr[by0:by1, bx0:bx1].astype(np.float32)
+    blended = region * (1 - bmask3) + barcode_crop * bmask3
+    result_bgr[by0:by1, bx0:bx1] = np.clip(blended, 0, 255).astype(np.uint8)
 
     # QR code intentionally removed - the flat label's Parcel Ref area
     # already has blank background + correct dividers, no paste-back needed.
